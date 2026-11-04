@@ -19,6 +19,11 @@ import pandas as pd
 import requests
 import yfinance as yf
 
+try:
+    from deep_translator import GoogleTranslator
+except Exception:  # 入っていなければ英語のまま表示する
+    GoogleTranslator = None
+
 # ---------------- 設定（ここを変えれば条件が変わる） ----------------
 MAX_LISTING_YEARS = 5      # 上場からこの年数以内だけ対象（足切り）
 MCAP_MAX = 300e8           # 時価総額の上限（円）
@@ -27,6 +32,7 @@ LIQ_PREFILTER = 2e7        # 売買代金(20日平均)がこれ未満は最初�
 LIQ_GOOD = 1e8             # 売買代金がこれ以上なら流動性 +2点
 LIQ_OK = 5e7               # これ以上なら +1点
 MAX_SCORE = 13
+SUMMARY_CHARS = 450        # 事業内容に使う英語説明の最大文字数（翻訳前）。増やすほど詳しくなる
 
 JPX_URL = ("https://www.jpx.co.jp/markets/statistics-equities/misc/"
            "tvdivq0000001vg2-att/data_j.xlsx")
@@ -98,12 +104,38 @@ def first_trade(info):
     return dt.datetime.fromtimestamp(ft, tz=dt.timezone.utc)
 
 
-def business_line(info):
-    parts = [p for p in (info.get("sector"), info.get("industry")) if p]
-    head = " / ".join(parts)
+def has_ja(s):
+    return any("぀" <= ch <= "ヿ" or "一" <= ch <= "鿿" for ch in s)
+
+
+def to_ja(text):
+    """英語 → 日本語（無料の機械翻訳）。失敗したら原文のまま返す"""
+    if not text or has_ja(text) or GoogleTranslator is None:
+        return text
+    for _ in range(3):
+        try:
+            return GoogleTranslator(source="en", target="ja").translate(text)
+        except Exception:
+            time.sleep(2)
+    return text
+
+
+def trim_sentences(s, limit):
+    s = " ".join(s.split())
+    if len(s) <= limit:
+        return s
+    cut = s[:limit]
+    i = cut.rfind(". ")
+    return cut[:i + 1] if i > 80 else cut
+
+
+def business_fields(info):
+    ind = info.get("industry") or info.get("sector") or ""
     summ = (info.get("longBusinessSummary") or "").strip()
-    first = summ.split(". ")[0][:90] if summ else ""
-    return (head + "｜" + first) if head and first else (head or first or "不明")
+    return {
+        "industry": to_ja(ind),
+        "business": to_ja(trim_sentences(summ, SUMMARY_CHARS)) if summ else "",
+    }
 
 
 # ---------------- 4. 財務 ----------------
@@ -206,89 +238,168 @@ def yen(x):
     if x is None or pd.isna(x):
         return "不明"
     if x == 0:
-        return "0"
+        return "0円"
     return f"{x / 1e8:,.1f}億円"
 
 
-def build_html(df, updated):
-    e = html.escape
-    rows = []
-    for _, r in df.iterrows():
-        code = r["code"]
-        ir = "https://www.google.com/search?q=" + quote(f"{r['name']} IR情報")
-        kabutan = f"https://kabutan.jp/stock/?code={code}"
-        yahoo = f"https://finance.yahoo.co.jp/quote/{code}.T"
-        g = "不明" if pd.isna(r["growth"]) else f"{int(r['growth'])}期"
-        dr = "不明" if pd.isna(r["debt_ratio"]) else f"{r['debt_ratio']:.2f}"
-        rows.append(
-            f'<tr data-band="{e(r["band"])}">'
-            f'<td data-v="{r["score"]}">{r["score"]}/{MAX_SCORE}</td>'
-            f'<td>{e(r["name"])}</td>'
-            f'<td class="biz">{e(r["business"])}</td>'
-            f'<td data-v="{r["years"]:.2f}">{r["years"]:.1f}年</td>'
-            f'<td>{e(r["band"])}</td>'
-            f'<td data-v="{r["mcap"] if pd.notna(r["mcap"]) else 0}">{yen(r["mcap"])}</td>'
-            f'<td data-v="{-1 if pd.isna(r["growth"]) else r["growth"]}">{g}</td>'
-            f'<td>{yen(r["ltd"])}</td>'
-            f'<td data-v="{r["debt_ratio"] if pd.notna(r["debt_ratio"]) else 99}">{dr}</td>'
-            f'<td data-v="{r["value"]:.0f}">{r["vol"] / 1e4:,.1f}万株<br>{yen(r["value"])}</td>'
-            f'<td>{e(code)}</td>'
-            f'<td><a href="{ir}" target="_blank">IR</a></td>'
-            f'<td><a href="{kabutan}" target="_blank">株探</a></td>'
-            f'<td data-v="{r["price"]}"><a href="{yahoo}" target="_blank">{r["price"]:,.0f}円</a></td>'
-            f'</tr>'
-        )
-    heads = ["スコア", "銘柄名", "事業内容", "上場年数", "上場区分", "時価総額", "増収増益",
-             "長期借入金", "負債比率", "出来高・売買代金(20日平均)", "コード", "IR情報",
-             "株探", "今日の株価"]
-    th = "".join(f'<th onclick="sortBy({i})">{h}</th>' for i, h in enumerate(heads))
-    return f"""<!doctype html>
+def shares(x):
+    if x is None or pd.isna(x):
+        return "不明"
+    if x >= 1e4:
+        return f"{x / 1e4:,.1f}万株"
+    return f"{x:,.0f}株"
+
+
+def num_attr(x):
+    return "" if (x is None or pd.isna(x)) else f"{x}"
+
+
+TEMPLATE = """<!doctype html>
 <html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>候補銘柄スクリーナー</title>
 <style>
-body{{font-family:-apple-system,sans-serif;margin:8px;font-size:13px}}
-.bar button{{margin:2px;padding:6px 10px;font-size:13px}}
-.wrap{{overflow-x:auto}}
-table{{border-collapse:collapse;white-space:nowrap}}
-th,td{{border:1px solid #ccc;padding:4px 6px;text-align:left}}
-th{{background:#f2f2f2;position:sticky;top:0;cursor:pointer}}
-td.biz{{white-space:normal;min-width:220px;max-width:320px}}
+:root{--bg:#f5f6f8;--card:#fff;--text:#1c1e21;--sub:#667085;--line:#e4e7ec;--accent:#2563eb;--good:#067647;--chip:#eef2ff}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#181b21;--text:#eceef2;--sub:#98a2b3;--line:#2a2f38;--accent:#7aa7ff;--good:#5fd38d;--chip:#1f2a4d}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 -apple-system,"Hiragino Sans",sans-serif}
+header.top{padding:12px 12px 6px}
+h1{font-size:17px;margin:0 0 2px}
+.meta{font-size:12px;color:var(--sub)}
+.ctl{position:sticky;top:0;z-index:5;background:var(--bg);padding:6px 12px 8px;border-bottom:1px solid var(--line)}
+.chips{display:flex;gap:6px;margin-bottom:6px}
+.chips button{flex:1;padding:8px 2px;font-size:13px;border:1px solid var(--line);border-radius:999px;background:var(--card);color:var(--text)}
+.chips button.on{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+.sortrow{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--sub)}
+select{flex:1;font-size:14px;padding:7px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text)}
+#list{padding:10px 12px 40px;display:grid;gap:10px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px}
+.hd{display:flex;gap:10px;align-items:center}
+.score{flex:none;min-width:56px;text-align:center;font-weight:700;font-size:24px;line-height:1;padding:9px 6px;border-radius:12px;background:var(--chip);color:var(--accent)}
+.score small{display:block;font-size:11px;font-weight:500;color:var(--sub);margin-top:4px}
+.hdr{min-width:0;flex:1}
+.tags{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:12px;color:var(--sub)}
+.code{font-weight:700;color:var(--text);font-size:15px}
+.flag{background:var(--chip);color:var(--accent);padding:1px 8px;border-radius:999px;font-weight:600}
+.name{font-size:12px;color:var(--sub);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.biz{margin:10px 0;font-size:14px}
+.biz b{display:inline-block;font-size:12px;color:var(--sub);font-weight:600;margin-right:6px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:6px 14px;margin:0 0 10px}
+.grid div{border-top:1px solid var(--line);padding-top:4px}
+dt{font-size:11px;color:var(--sub)}
+dd{margin:0;font-weight:600;font-size:14px}
+.ok{color:var(--good)}
+.links{display:flex;gap:8px}
+.links a{flex:1;text-align:center;padding:11px 4px;border:1px solid var(--line);border-radius:10px;text-decoration:none;color:var(--accent);font-size:14px;font-weight:600}
+.foot{padding:0 12px 30px;font-size:12px;color:var(--sub)}
 </style></head><body>
-<h3>候補銘柄スクリーナー（日本株）</h3>
-<p>更新: {updated}　/ 表示 {len(df)} 銘柄　/ 見出しタップで並べ替え</p>
-<div class="bar">
-<button onclick="flt('')">全て</button>
-<button onclick="flt('2y')">2年以内</button>
-<button onclick="flt('半年〜2年')">半年〜2年</button>
-<button onclick="flt('2〜5年')">2〜5年</button>
+<header class="top">
+<h1>候補銘柄スクリーナー（日本株）</h1>
+<div class="meta">更新 __UPDATED__ ／ <span id="cnt">__COUNT__</span>銘柄 ／ __MAX__点満点</div>
+</header>
+<div class="ctl">
+<div class="chips">
+<button class="on" onclick="setBand(this,'')">全て</button>
+<button onclick="setBand(this,'2y')">2年以内</button>
+<button onclick="setBand(this,'半年〜2年')">半年〜2年</button>
+<button onclick="setBand(this,'2〜5年')">2〜5年</button>
 </div>
-<div class="wrap"><table id="t"><thead><tr>{th}</tr></thead>
-<tbody>{''.join(rows)}</tbody></table></div>
-<p>※ 約定回数は取得できないため、売買代金で代用しています。最終確認は証券会社アプリで。</p>
+<div class="sortrow">並び順
+<select onchange="setSort(this.value)">
+<option value="score">スコアが高い順</option>
+<option value="value">売買代金が大きい順</option>
+<option value="mcap">時価総額が小さい順</option>
+<option value="years">上場が新しい順</option>
+<option value="dr">負債比率が低い順</option>
+</select></div>
+</div>
+<div id="list">__CARDS__</div>
+<p class="foot">※ 約定回数は取得できないため、売買代金で代用しています。最終確認は証券会社アプリで。事業内容は英語の説明を機械翻訳したものです。</p>
 <script>
-function flt(b){{
-  document.querySelectorAll('#t tbody tr').forEach(r=>{{
-    var x=r.dataset.band, show=true;
-    if(b==='2y') show=(x==='半年未満'||x==='半年〜2年');
-    else if(b) show=(x===b);
-    r.style.display=show?'':'none';
-  }});
-}}
-var dir={{}};
-function sortBy(i){{
-  var tb=document.querySelector('#t tbody'), rs=Array.from(tb.rows);
-  dir[i]=!dir[i];
-  rs.sort(function(a,b){{
-    var x=a.cells[i], y=b.cells[i];
-    var xv=x.dataset.v!==undefined?parseFloat(x.dataset.v):x.textContent;
-    var yv=y.dataset.v!==undefined?parseFloat(y.dataset.v):y.textContent;
-    var c=(xv>yv)-(xv<yv);
-    return dir[i]?c:-c;
-  }});
-  rs.forEach(r=>tb.appendChild(r));
-}}
+var cur={band:'',sort:'score'};
+function num(c,k,empty){var v=parseFloat(c.dataset[k]);return isNaN(v)?empty:v;}
+function apply(){
+  var box=document.getElementById('list');
+  var cs=Array.prototype.slice.call(box.children);
+  cs.sort(function(a,b){
+    var s=cur.sort;
+    if(s==='score'){return (num(b,'score',-1)-num(a,'score',-1))||(num(b,'value',0)-num(a,'value',0));}
+    if(s==='value'){return num(b,'value',0)-num(a,'value',0);}
+    if(s==='mcap'){return num(a,'mcap',1e30)-num(b,'mcap',1e30);}
+    if(s==='years'){return num(a,'years',1e30)-num(b,'years',1e30);}
+    if(s==='dr'){return num(a,'dr',1e30)-num(b,'dr',1e30);}
+    return 0;
+  });
+  var n=0;
+  cs.forEach(function(c){
+    var x=c.dataset.band,show=true;
+    if(cur.band==='2y')show=(x==='半年未満'||x==='半年〜2年');
+    else if(cur.band)show=(x===cur.band);
+    c.style.display=show?'':'none';
+    if(show)n++;
+    box.appendChild(c);
+  });
+  document.getElementById('cnt').textContent=n;
+}
+function setBand(btn,b){
+  cur.band=b;
+  Array.prototype.forEach.call(btn.parentNode.children,function(x){x.classList.remove('on');});
+  btn.classList.add('on');apply();
+}
+function setSort(s){cur.sort=s;apply();}
 </script></body></html>"""
+
+
+def build_html(df, updated):
+    e = html.escape
+    cards = []
+    for _, r in df.iterrows():
+        code = str(r["code"])
+        ir = "https://www.google.com/search?q=" + quote(f"{r['name']} IR情報")
+        kabutan = f"https://kabutan.jp/stock/?code={code}"
+        yahoo = f"https://finance.yahoo.co.jp/quote/{code}.T"
+
+        g_ok = pd.notna(r["growth"]) and r["growth"] >= 3
+        g = "不明" if pd.isna(r["growth"]) else f"{int(r['growth'])}期連続"
+        ltd_ok = pd.notna(r["ltd"]) and r["ltd"] == 0
+        ltd = "なし" if ltd_ok else yen(r["ltd"])
+        dr_ok = pd.notna(r["debt_ratio"]) and r["debt_ratio"] <= DEBT_RATIO_MAX
+        dr = "不明" if pd.isna(r["debt_ratio"]) else f"{r['debt_ratio']:.2f}"
+        mc_ok = pd.notna(r["mcap"]) and r["mcap"] <= MCAP_MAX
+
+        def cls(ok):
+            return ' class="ok"' if ok else ""
+
+        industry = str(r.get("industry") or "").strip()
+        biz = str(r.get("business") or "").strip() or "（事業内容を取得できませんでした）"
+        ind_html = f"<b>{e(industry)}</b>" if industry else ""
+
+        cards.append(
+            f'<article class="card" data-band="{e(r["band"])}" data-score="{r["score"]}" '
+            f'data-value="{r["value"]:.0f}" data-mcap="{num_attr(r["mcap"])}" '
+            f'data-years="{r["years"]:.2f}" data-dr="{num_attr(r["debt_ratio"])}">'
+            f'<div class="hd"><div class="score">{r["score"]}<small>/ {MAX_SCORE}</small></div>'
+            f'<div class="hdr"><div class="tags"><span class="code">{e(code)}</span>'
+            f'<span class="flag">{e(r["band"])}</span><span>上場{r["years"]:.1f}年</span></div>'
+            f'<div class="name">{e(str(r["name"]))}</div></div></div>'
+            f'<p class="biz">{ind_html}{e(biz)}</p>'
+            f'<dl class="grid">'
+            f'<div><dt>時価総額</dt><dd{cls(mc_ok)}>{yen(r["mcap"])}</dd></div>'
+            f'<div><dt>増収増益</dt><dd{cls(g_ok)}>{g}</dd></div>'
+            f'<div><dt>長期借入金</dt><dd{cls(ltd_ok)}>{ltd}</dd></div>'
+            f'<div><dt>負債比率</dt><dd{cls(dr_ok)}>{dr}</dd></div>'
+            f'<div><dt>売買代金(20日平均)</dt><dd>{yen(r["value"])}</dd></div>'
+            f'<div><dt>出来高(20日平均)</dt><dd>{shares(r["vol"])}</dd></div>'
+            f'</dl>'
+            f'<div class="links"><a href="{kabutan}" target="_blank">株探</a>'
+            f'<a href="{ir}" target="_blank">IR情報</a>'
+            f'<a href="{yahoo}" target="_blank">株価 {r["price"]:,.0f}円</a></div>'
+            f'</article>'
+        )
+    return (TEMPLATE.replace("__UPDATED__", updated)
+            .replace("__COUNT__", str(len(df)))
+            .replace("__MAX__", str(MAX_SCORE))
+            .replace("__CARDS__", "".join(cards)))
 
 
 # ---------------- main ----------------
@@ -315,7 +426,7 @@ def main():
         fin = get_fin(r["ticker"])
         rec = {
             "code": r["code"], "name": r["name"],
-            "business": business_line(info),
+            **business_fields(info),
             "years": years, "band": band(years),
             "mcap": info.get("marketCap"),
             **fin, **liq[r["ticker"]],
@@ -328,7 +439,7 @@ def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     updated = dt.datetime.now(JST).strftime("%Y-%m-%d %H:%M JST")
     if df.empty:
-        df = pd.DataFrame(columns=["code", "name", "business", "years", "band", "mcap",
+        df = pd.DataFrame(columns=["code", "name", "industry", "business", "years", "band", "mcap",
                                    "growth", "ltd", "debt_ratio", "price", "vol",
                                    "value", "score"])
     else:
