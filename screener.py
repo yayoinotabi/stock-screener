@@ -10,19 +10,41 @@
 """
 import datetime as dt
 import html
+import importlib
 import io
 import os
+import re
+import subprocess
+import sys
 import time
+import unicodedata
 from urllib.parse import quote
 
 import pandas as pd
 import requests
 import yfinance as yf
 
-try:
-    from deep_translator import GoogleTranslator
-except Exception:  # 入っていなければ英語のまま表示する
-    GoogleTranslator = None
+
+
+def _import_optional(module, pip_name):
+    """ライブラリが無ければ自動でインストールして読み込む。ダメならNone"""
+    try:
+        return importlib.import_module(module)
+    except Exception:
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", pip_name],
+                           check=True, timeout=300)
+            importlib.invalidate_caches()
+            return importlib.import_module(module)
+        except Exception as e:
+            print(f"WARN: {pip_name} を使えません: {e}")
+            return None
+
+
+_dt_mod = _import_optional("deep_translator", "deep-translator")
+GoogleTranslator = getattr(_dt_mod, "GoogleTranslator", None) if _dt_mod else None
+_bs4_mod = _import_optional("bs4", "beautifulsoup4")
+BeautifulSoup = getattr(_bs4_mod, "BeautifulSoup", None) if _bs4_mod else None
 
 # ---------------- 設定（ここを変えれば条件が変わる） ----------------
 MAX_LISTING_YEARS = 5      # 上場からこの年数以内だけ対象（足切り）
@@ -32,6 +54,7 @@ LIQ_PREFILTER = 2e7        # 売買代金(20日平均)がこれ未満は最初�
 LIQ_GOOD = 1e8             # 売買代金がこれ以上なら流動性 +2点
 LIQ_OK = 5e7               # これ以上なら +1点
 MAX_SCORE = 13
+USE_YAHOO_PROFILE = True   # Yahoo!ファイナンスの企業情報から日本語の「特色」「連結事業」を取る（使わないならFalse）
 SUMMARY_CHARS = 450        # 事業内容に使う英語説明の最大文字数（翻訳前）。増やすほど詳しくなる
 
 JPX_URL = ("https://www.jpx.co.jp/markets/statistics-equities/misc/"
@@ -108,16 +131,96 @@ def has_ja(s):
     return any("぀" <= ch <= "ヿ" or "一" <= ch <= "鿿" for ch in s)
 
 
+def _gtx(text):
+    """予備の翻訳ルート（ライブラリを使わず直接問い合わせる）"""
+    r = requests.get("https://translate.googleapis.com/translate_a/single",
+                     params={"client": "gtx", "sl": "en", "tl": "ja", "dt": "t", "q": text},
+                     timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    return "".join(seg[0] for seg in r.json()[0] if seg and seg[0])
+
+
 def to_ja(text):
     """英語 → 日本語（無料の機械翻訳）。失敗したら原文のまま返す"""
-    if not text or has_ja(text) or GoogleTranslator is None:
+    if not text or has_ja(text):
         return text
-    for _ in range(3):
-        try:
-            return GoogleTranslator(source="en", target="ja").translate(text)
-        except Exception:
-            time.sleep(2)
+    routes = []
+    if GoogleTranslator is not None:
+        routes.append(lambda t: GoogleTranslator(source="en", target="ja").translate(t))
+    routes.append(_gtx)
+    for fn in routes:
+        for _ in range(2):
+            try:
+                out = fn(text)
+                if out and has_ja(out):
+                    return out
+            except Exception:
+                time.sleep(2)
     return text
+
+
+EMPTY_PROFILE = {"feature": "", "segments": "", "ceo": ""}
+
+
+def yahoo_profile(code):
+    """Yahoo!ファイナンス企業情報ページから 特色・連結事業・代表者名 を取る。
+    ページの作りが変わると取れなくなるので、取れなければ空で返す。"""
+    if BeautifulSoup is None:
+        return dict(EMPTY_PROFILE)
+    url = f"https://finance.yahoo.co.jp/quote/{code}.T/profile"
+    try:
+        r = requests.get(url, timeout=30, headers={
+            "User-Agent": "Mozilla/5.0 (compatible; personal-screener)",
+            "Accept-Language": "ja"})
+        if r.status_code != 200:
+            print("profile", code, "status", r.status_code)
+            return dict(EMPTY_PROFILE)
+        soup = BeautifulSoup(r.text, "html.parser")
+        for t in soup(["script", "style"]):
+            t.decompose()
+        lines = [t.strip() for t in soup.get_text("\n").split("\n") if t.strip()]
+    except Exception as e:
+        print("profile error", code, e)
+        return dict(EMPTY_PROFILE)
+
+    labels = {"特色", "連結事業", "代表者名", "業種分類", "英文社名", "設立年月日", "市場名",
+              "上場年月日", "決算", "本社所在地", "単元株数", "従業員数（単独）", "従業員数（連結）",
+              "平均年齢", "平均年収", "最近見た銘柄"}
+
+    def after(label):
+        for i, t in enumerate(lines[:-1]):
+            if t == label and lines[i + 1] not in labels and len(lines[i + 1]) >= 2:
+                return lines[i + 1]
+        return ""
+
+    out = {"feature": after("特色"), "segments": after("連結事業"), "ceo": after("代表者名")}
+    if not out["feature"] and not out["segments"]:
+        print("profile not parsed", code, lines[:5])
+    return out
+
+
+def parse_segments(text):
+    """「Ａ事業95、Ｂ事業5、他0(2025.12)」→ ([(名前, %), ...], '2025.12')"""
+    t = unicodedata.normalize("NFKC", text or "").strip()
+    asof = ""
+    m = re.search(r"\((\d{4}[./]\d{1,2})\)\s*$", t)
+    if m:
+        asof = m.group(1)
+        t = t[:m.start()].strip()
+    items = []
+    for part in re.split(r"[、,]", t):
+        part = part.strip()
+        if not part:
+            continue
+        m = re.match(r"^(.*?)\s*(\d+(?:\.\d+)?)$", part)
+        if m and m.group(1):
+            items.append((m.group(1), float(m.group(2))))
+        else:
+            items.append((part, None))
+    nums = [x for x in items if x[1] is not None]
+    if len(nums) == len(items):
+        items = [x for x in sorted(items, key=lambda x: -x[1]) if x[1] > 0]
+    return items, asof
 
 
 def trim_sentences(s, limit):
@@ -250,6 +353,10 @@ def shares(x):
     return f"{x:,.0f}株"
 
 
+def txt(x):
+    return "" if (x is None or (not isinstance(x, str) and pd.isna(x))) else str(x).strip()
+
+
 def num_attr(x):
     return "" if (x is None or pd.isna(x)) else f"{x}"
 
@@ -284,12 +391,17 @@ select{flex:1;font-size:14px;padding:7px;border:1px solid var(--line);border-rad
 .name{font-size:12px;color:var(--sub);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .biz{margin:10px 0;font-size:14px}
 .biz b{display:inline-block;font-size:12px;color:var(--sub);font-weight:600;margin-right:6px}
+.biz2{margin:-4px 0 10px;font-size:13px;color:var(--sub)}
+.segs{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:0 0 10px;font-size:12px}
+.cap{color:var(--sub)}
+.seg{border:1px solid var(--line);border-radius:999px;padding:2px 9px}
+.seg.top{background:var(--chip);color:var(--accent);border-color:transparent;font-weight:600}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:6px 14px;margin:0 0 10px}
 .grid div{border-top:1px solid var(--line);padding-top:4px}
 dt{font-size:11px;color:var(--sub)}
 dd{margin:0;font-weight:600;font-size:14px}
 .ok{color:var(--good)}
-.links{display:flex;gap:8px}
+.links{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 .links a{flex:1;text-align:center;padding:11px 4px;border:1px solid var(--line);border-radius:10px;text-decoration:none;color:var(--accent);font-size:14px;font-weight:600}
 .foot{padding:0 12px 30px;font-size:12px;color:var(--sub)}
 </style></head><body>
@@ -314,7 +426,7 @@ dd{margin:0;font-weight:600;font-size:14px}
 </select></div>
 </div>
 <div id="list">__CARDS__</div>
-<p class="foot">※ 約定回数は取得できないため、売買代金で代用しています。最終確認は証券会社アプリで。事業内容は英語の説明を機械翻訳したものです。</p>
+<p class="foot">※ 約定回数は取得できないため、売買代金で代用しています。最終確認は証券会社アプリで。「特色」「事業構成」はYahoo!ファイナンス、取れない銘柄の事業内容は英語の説明の機械翻訳です（事業構成の数字は売上の構成比（%）と思われます）。</p>
 <script>
 var cur={band:'',sort:'score'};
 function num(c,k,empty){var v=parseFloat(c.dataset[k]);return isNaN(v)?empty:v;}
@@ -358,6 +470,7 @@ def build_html(df, updated):
         ir = "https://www.google.com/search?q=" + quote(f"{r['name']} IR情報")
         kabutan = f"https://kabutan.jp/stock/?code={code}"
         yahoo = f"https://finance.yahoo.co.jp/quote/{code}.T"
+        profile = f"https://finance.yahoo.co.jp/quote/{code}.T/profile"
 
         g_ok = pd.notna(r["growth"]) and r["growth"] >= 3
         g = "不明" if pd.isna(r["growth"]) else f"{int(r['growth'])}期連続"
@@ -370,9 +483,29 @@ def build_html(df, updated):
         def cls(ok):
             return ' class="ok"' if ok else ""
 
-        industry = str(r.get("industry") or "").strip()
-        biz = str(r.get("business") or "").strip() or "（事業内容を取得できませんでした）"
+        industry = txt(r.get("industry"))
+        feature = txt(r.get("feature"))
+        summary = txt(r.get("business"))
+        ceo = txt(r.get("ceo"))
+        if feature:
+            lead = feature
+            sub = summary if has_ja(summary) else ""   # 英語のままの説明は出さない
+        else:
+            lead = summary or "（事業内容を取得できませんでした）"
+            sub = ""
         ind_html = f"<b>{e(industry)}</b>" if industry else ""
+        sub_html = f'<p class="biz2">{e(sub)}</p>' if sub else ""
+        ceo_html = f"　代表 {e(ceo)}" if ceo else ""
+        seg_items, seg_asof = parse_segments(txt(r.get("segments")))
+        seg_block = ""
+        if seg_items:
+            chips = "".join(
+                '<span class="seg{}">{}</span>'.format(
+                    " top" if i == 0 else "",
+                    e(f"{n} {p:g}%") if p is not None else e(n))
+                for i, (n, p) in enumerate(seg_items))
+            cap = "事業構成" + (f"（{seg_asof}）" if seg_asof else "")
+            seg_block = f'<div class="segs"><span class="cap">{e(cap)}</span>{chips}</div>'
 
         cards.append(
             f'<article class="card" data-band="{e(r["band"])}" data-score="{r["score"]}" '
@@ -381,8 +514,8 @@ def build_html(df, updated):
             f'<div class="hd"><div class="score">{r["score"]}<small>/ {MAX_SCORE}</small></div>'
             f'<div class="hdr"><div class="tags"><span class="code">{e(code)}</span>'
             f'<span class="flag">{e(r["band"])}</span><span>上場{r["years"]:.1f}年</span></div>'
-            f'<div class="name">{e(str(r["name"]))}</div></div></div>'
-            f'<p class="biz">{ind_html}{e(biz)}</p>'
+            f'<div class="name">{e(str(r["name"]))}{ceo_html}</div></div></div>'
+            f'<p class="biz">{ind_html}{e(lead)}</p>{sub_html}{seg_block}'
             f'<dl class="grid">'
             f'<div><dt>時価総額</dt><dd{cls(mc_ok)}>{yen(r["mcap"])}</dd></div>'
             f'<div><dt>増収増益</dt><dd{cls(g_ok)}>{g}</dd></div>'
@@ -392,6 +525,7 @@ def build_html(df, updated):
             f'<div><dt>出来高(20日平均)</dt><dd>{shares(r["vol"])}</dd></div>'
             f'</dl>'
             f'<div class="links"><a href="{kabutan}" target="_blank">株探</a>'
+            f'<a href="{profile}" target="_blank">企業情報</a>'
             f'<a href="{ir}" target="_blank">IR情報</a>'
             f'<a href="{yahoo}" target="_blank">株価 {r["price"]:,.0f}円</a></div>'
             f'</article>'
@@ -427,19 +561,20 @@ def main():
         rec = {
             "code": r["code"], "name": r["name"],
             **business_fields(info),
+            **(yahoo_profile(r["code"]) if USE_YAHOO_PROFILE else EMPTY_PROFILE),
             "years": years, "band": band(years),
             "mcap": info.get("marketCap"),
             **fin, **liq[r["ticker"]],
         }
         rec["score"] = score(rec)
         rows.append(rec)
-        time.sleep(0.3)
+        time.sleep(1.0 if USE_YAHOO_PROFILE else 0.3)
 
     df = pd.DataFrame(rows)
     os.makedirs(OUT_DIR, exist_ok=True)
     updated = dt.datetime.now(JST).strftime("%Y-%m-%d %H:%M JST")
     if df.empty:
-        df = pd.DataFrame(columns=["code", "name", "industry", "business", "years", "band", "mcap",
+        df = pd.DataFrame(columns=["code", "name", "industry", "business", "feature", "segments", "ceo", "years", "band", "mcap",
                                    "growth", "ltd", "debt_ratio", "price", "vol",
                                    "value", "score"])
     else:
